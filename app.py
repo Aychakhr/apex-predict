@@ -9,17 +9,12 @@ import re
 import glob
 import tempfile
 
-# ─── ENVIRONMENT BRIDGE ──────────────────────────────────────────────────────
-# mlst, abricate, and ectyper live in the bioinformatics conda env, not here.
-# Inject its bin directory into PATH so all subprocess calls find them.
-# Update BIOTOOLS_BIN to match your actual conda env path:
-#   conda activate biotools && which mlst  → copy the directory part
+# ENVIRONMENT BRIDGE
 BIOTOOLS_BIN = os.environ.get(
     "BIOTOOLS_BIN",
     "/home/khera_aycha/miniconda3/envs/apec_a/bin"
 )
 os.environ["PATH"] = BIOTOOLS_BIN + os.pathsep + os.environ.get("PATH", "")
-# ─────────────────────────────────────────────────────────────────────────────
 
 def get_base64_of_bin_file(bin_file):
     with open(bin_file, 'rb') as f:
@@ -41,45 +36,52 @@ def detect_serogroup_with_ectyper(fasta_path):
         if os.path.exists(output_dir):
             shutil.rmtree(output_dir)
             
-        # ECTyper cannot access /mnt/ WSL paths; copy to native Linux tmp first
         linux_tmp = tempfile.mkdtemp(prefix="/tmp/ectyper_in_")
         linux_fasta = os.path.join(linux_tmp, "sample.fna")
         shutil.copy2(fasta_path, linux_fasta)
-        linux_output_dir = "/tmp/ectyper_out_" + os.path.basename(linux_tmp)
-        if os.path.exists(linux_output_dir):
-            shutil.rmtree(linux_output_dir)
+        linux_output_dir = tempfile.mkdtemp(prefix="/tmp/ectyper_out_")
+        shutil.rmtree(linux_output_dir)
         cmd = f"ectyper --input {linux_fasta} --output {linux_output_dir}"
         result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, universal_newlines=True,
                                 timeout=40)
 
-        tsv_path = os.path.join(linux_output_dir, "output.tsv")
-        
-        if not os.path.exists(tsv_path):
+        output_path = None
+        for candidate in [
+            os.path.join(linux_output_dir, "output.csv"),
+            os.path.join(linux_output_dir, "output.tsv"),
+        ]:
+            if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+                output_path = candidate
+                break
+
+        if output_path is None:
             search_paths = (
-                glob.glob(os.path.join(linux_output_dir, "**", "output.tsv"), recursive=True) or
-                glob.glob(os.path.join(linux_output_dir, "**", "*_output.tsv"), recursive=True) or
+                glob.glob(os.path.join(linux_output_dir, "**", "*.csv"), recursive=True) or
                 glob.glob(os.path.join(linux_output_dir, "**", "*.tsv"), recursive=True)
             )
             if search_paths:
-                tsv_path = search_paths[0]
+                output_path = search_paths[0]
 
-        if os.path.exists(tsv_path) and os.path.getsize(tsv_path) > 0:
-            df_ec = pd.read_csv(tsv_path, sep='\t')
-            
+        if output_path is not None and os.path.getsize(output_path) > 0:
+            sep = '\t' if output_path.endswith('.tsv') else ','
+            df_ec = pd.read_csv(output_path, sep=sep)
+
             if not df_ec.empty:
                 serogroup = "Unknown"
                 serotype = "Unknown"
-                
-                if "O.type" in df_ec.columns:
-                    serogroup = str(df_ec.iloc[0]["O.type"]).strip()
-                elif "O_type" in df_ec.columns:
-                    serogroup = str(df_ec.iloc[0]["O_type"]).strip()
-                elif "Serogroup" in df_ec.columns:
-                    serogroup = str(df_ec.iloc[0]["Serogroup"]).strip()
+
+                for col in ["O_prediction", "O.type", "O_type", "Serogroup"]:
+                    if col in df_ec.columns:
+                        serogroup = str(df_ec.iloc[0][col]).strip()
+                        break
 
                 if "Serotype" in df_ec.columns:
                     serotype = str(df_ec.iloc[0]["Serotype"]).strip()
+                elif "O_prediction" in df_ec.columns and "H_prediction" in df_ec.columns:
+                    o = str(df_ec.iloc[0]["O_prediction"]).strip()
+                    h = str(df_ec.iloc[0]["H_prediction"]).strip()
+                    serotype = f"{o}:{h}"
 
                 if not serogroup or serogroup in ["-", "nan", "NA"]:
                     serogroup = "Unknown"
@@ -193,6 +195,12 @@ st.markdown(
         color: #064949 !important;
         font-size: 28px;
     }}
+    [data-testid="stHorizontalBlock"] {{
+        background-color: white !important;
+        border-radius: 10px;
+        padding: 1rem;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.07);
+    }}
     .streamlit-expanderContent {{
         background-color: rgba(255,255,255,0.96) !important;
         padding: 1rem;
@@ -216,7 +224,7 @@ st.markdown(
 st.markdown('<div class="main-title">🦠ApexPredict</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-title">Pathotype Classification, MLST, Serogroup Detection, and Resistance Profiling</div>', unsafe_allow_html=True)
 
-# NOTE: st.cache is removed in Streamlit >= 1.18; use st.cache_resource instead
+
 @st.cache_resource
 def load_analytical_assets():
     model = joblib.load("apec_random_forest_model.joblib")
@@ -234,9 +242,7 @@ uploaded_file = st.file_uploader("Upload Bacterial FASTA", type=["fna", "fasta"]
 if uploaded_file is not None:
     temp_path = "temp_sample.fna"
     raw_bytes = uploaded_file.getbuffer().tobytes()
-    # Normalize line endings (Windows CRLF -> LF) so ECTyper accepts the file
     raw_text = raw_bytes.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
-    # Ensure every header line starts cleanly with >
     clean_lines = []
     for line in raw_text.splitlines():
         line = line.strip()
@@ -420,3 +426,4 @@ if uploaded_file is not None:
     for temp_file in ["temp_ectyper_results.txt", "ectyper_output.json"]:
         if os.path.exists(temp_file):
             os.remove(temp_file)
+            

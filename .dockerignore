@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.git/
+.gitignore
+temp_*.fna
+temp_ectyper_*
+*.log
+.streamlit/
+.DS_Store
